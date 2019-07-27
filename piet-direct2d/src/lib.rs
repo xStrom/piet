@@ -1,6 +1,8 @@
 //! The Direct2D backend for the Piet 2D graphics abstraction.
 
 mod conv;
+mod d2d;
+mod dwrite;
 pub mod error;
 
 use crate::conv::{
