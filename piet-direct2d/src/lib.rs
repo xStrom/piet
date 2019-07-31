@@ -3,37 +3,23 @@
 mod conv;
 mod d2d;
 mod dwrite;
-pub mod error;
+
+pub use d2d::{D2DDevice, D2DFactory};
+pub use dwrite::DwriteFactory;
 
 use crate::conv::{
     affine_to_matrix3x2f, color_to_colorf, convert_stroke_style, gradient_stop_to_d2d,
     rect_to_rectf, to_point2f,
 };
-use crate::error::WrapError;
 
 use std::borrow::Cow;
 
-use winapi::shared::basetsd::UINT32;
-use winapi::um::dcommon::D2D_SIZE_U;
-
-use dxgi::Format;
-
-use direct2d::brush::gradient::linear::LinearGradientBrushBuilder;
-use direct2d::brush::gradient::radial::RadialGradientBrushBuilder;
-use direct2d::brush::{Brush, GenericBrush, SolidColorBrush};
-use direct2d::enums::{
-    AlphaMode, BitmapInterpolationMode, DrawTextOptions, FigureBegin, FigureEnd, FillMode,
+use winapi::um::d2d1::{
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
+    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES,
 };
-use direct2d::geometry::path::{FigureBuilder, GeometryBuilder};
-use direct2d::geometry::Path;
-use direct2d::image::Bitmap;
-use direct2d::layer::Layer;
-use direct2d::math::{BezierSegment, QuadBezierSegment, SizeU, Vector2F};
-use direct2d::render_target::{GenericRenderTarget, RenderTarget};
-
-use directwrite::text_format::TextFormatBuilder;
-use directwrite::text_layout;
-use directwrite::TextFormat;
+use winapi::um::dcommon::{D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED};
 
 use piet::kurbo::{Affine, PathEl, Point, Rect, Shape};
 
@@ -42,12 +28,13 @@ use piet::{
     InterpolationMode, RenderContext, StrokeStyle, Text, TextLayout, TextLayoutBuilder,
 };
 
+use d2d::{Bitmap, Brush, DeviceContext, PathGeometry};
+use dwrite::{TextFormat, TextFormatBuilder};
+
 pub struct D2DRenderContext<'a> {
-    factory: &'a direct2d::Factory,
+    factory: &'a D2DFactory,
     inner_text: D2DText<'a>,
-    // This is an owned clone, but after some direct2d refactor, it's likely we'll
-    // hold a mutable reference.
-    rt: GenericRenderTarget,
+    rt: &'a mut DeviceContext,
 
     /// The context state stack. There is always at least one, until finishing.
     ctx_stack: Vec<CtxState>,
@@ -56,7 +43,7 @@ pub struct D2DRenderContext<'a> {
 }
 
 pub struct D2DText<'a> {
-    dwrite: &'a directwrite::Factory,
+    dwrite: &'a DwriteFactory,
 }
 
 pub struct D2DFont(TextFormat);
@@ -66,12 +53,10 @@ pub struct D2DFontBuilder<'a> {
     name: String,
 }
 
-pub struct D2DTextLayout(text_layout::TextLayout);
+pub struct D2DTextLayout(dwrite::TextLayout);
 
 pub struct D2DTextLayoutBuilder<'a> {
-    builder: text_layout::TextLayoutBuilder<'a>,
-    format: TextFormat,
-    text: String,
+    builder: dwrite::TextLayoutBuilder<'a>,
 }
 
 #[derive(Default)]
@@ -84,21 +69,19 @@ struct CtxState {
 }
 
 impl<'b, 'a: 'b> D2DRenderContext<'a> {
-    /// Create a new Piet RenderContext for the Direct2D RenderTarget.
+    /// Create a new Piet RenderContext for the Direct2D DeviceContext.
     ///
-    /// Note: the signature of this function has more restrictive lifetimes than
-    /// the implementation requires, because we actually clone the RT, but this
-    /// will likely change.
-    pub fn new<RT: RenderTarget>(
-        factory: &'a direct2d::Factory,
-        dwrite: &'a directwrite::Factory,
-        rt: &'b mut RT,
+    /// TODO: check signature.
+    pub fn new(
+        factory: &'a D2DFactory,
+        dwrite: &'a DwriteFactory,
+        rt: &'b mut DeviceContext,
     ) -> D2DRenderContext<'b> {
         let inner_text = D2DText { dwrite };
         D2DRenderContext {
             factory,
             inner_text: inner_text,
-            rt: rt.as_generic(),
+            rt,
             ctx_stack: vec![CtxState::default()],
             err: Ok(()),
         }
@@ -118,87 +101,49 @@ impl<'b, 'a: 'b> D2DRenderContext<'a> {
     }
 }
 
-enum PathBuilder<'a> {
-    Geom(GeometryBuilder<'a>),
-    Fig(FigureBuilder<'a>),
-}
-
-impl<'a> PathBuilder<'a> {
-    fn finish_figure(self) -> GeometryBuilder<'a> {
-        match self {
-            PathBuilder::Geom(g) => g,
-            PathBuilder::Fig(f) => f.end(),
-        }
-    }
-}
-
 fn path_from_shape(
-    d2d: &direct2d::Factory,
+    d2d: &D2DFactory,
     is_filled: bool,
     shape: impl Shape,
     fill_rule: FillRule,
-) -> Result<Path, Error> {
-    let mut path = Path::create(d2d).wrap()?;
-    {
-        let mut g = path.open().wrap()?;
-        if fill_rule == FillRule::NonZero {
-            g = g.fill_mode(FillMode::Winding);
-        }
-        let mut builder = Some(PathBuilder::Geom(g));
-        for el in shape.to_bez_path(1e-3) {
-            match el {
-                PathEl::MoveTo(p) => {
-                    // TODO: we don't know this now. Will get fixed in direct2d crate.
-                    let is_closed = is_filled;
-                    if let Some(b) = builder.take() {
-                        let g = b.finish_figure();
-                        let begin = if is_filled {
-                            FigureBegin::Filled
-                        } else {
-                            FigureBegin::Hollow
-                        };
-                        let end = if is_closed {
-                            FigureEnd::Closed
-                        } else {
-                            FigureEnd::Open
-                        };
-                        let f = g.begin_figure(to_point2f(p), begin, end);
-                        builder = Some(PathBuilder::Fig(f));
-                    }
+) -> Result<PathGeometry, Error> {
+    let mut path = d2d.create_path_geometry()?;
+    let mut sink = path.open()?;
+    sink.set_fill_mode(fill_rule);
+    let mut need_close = false;
+    for el in shape.to_bez_path(1e-3) {
+        match el {
+            PathEl::MoveTo(p) => {
+                if need_close {
+                    sink.end_figure(false);
                 }
-                PathEl::LineTo(p) => {
-                    if let Some(PathBuilder::Fig(f)) = builder.take() {
-                        let f = f.add_line(to_point2f(p));
-                        builder = Some(PathBuilder::Fig(f));
-                    }
-                }
-                PathEl::QuadTo(p1, p2) => {
-                    if let Some(PathBuilder::Fig(f)) = builder.take() {
-                        let q = QuadBezierSegment::new(to_point2f(p1), to_point2f(p2));
-                        let f = f.add_quadratic_bezier(&q);
-                        builder = Some(PathBuilder::Fig(f));
-                    }
-                }
-                PathEl::CurveTo(p1, p2, p3) => {
-                    if let Some(PathBuilder::Fig(f)) = builder.take() {
-                        let c = BezierSegment::new(to_point2f(p1), to_point2f(p2), to_point2f(p3));
-                        let f = f.add_bezier(&c);
-                        builder = Some(PathBuilder::Fig(f));
-                    }
-                }
-                _ => (),
+                sink.begin_figure(to_point2f(p), is_filled);
+                need_close = true;
+            }
+            PathEl::LineTo(p) => {
+                sink.add_line(to_point2f(p));
+            }
+            PathEl::QuadTo(p1, p2) => {
+                sink.add_quadratic_bezier(to_point2f(p1), to_point2f(p2));
+            }
+            PathEl::CurveTo(p1, p2, p3) => {
+                sink.add_bezier(to_point2f(p1), to_point2f(p2), to_point2f(p3));
+            }
+            PathEl::ClosePath => {
+                sink.end_figure(true);
+                need_close = false;
             }
         }
-        if let Some(b) = builder.take() {
-            // TODO: think about what to do on error
-            let _ = b.finish_figure().close();
-        }
     }
+    if need_close {
+        sink.end_figure(false);
+    }
+    sink.close()?;
     Ok(path)
 }
 
 impl<'a> RenderContext for D2DRenderContext<'a> {
-    type Brush = GenericBrush;
+    type Brush = Brush;
 
     type Text = D2DText<'a>;
 
@@ -211,43 +156,38 @@ impl<'a> RenderContext for D2DRenderContext<'a> {
     }
 
     fn clear(&mut self, color: Color) {
-        self.rt.clear(color.as_rgba32() >> 8);
+        self.rt.clear(color_to_colorf(color));
     }
 
-    fn solid_brush(&mut self, color: Color) -> GenericBrush {
-        SolidColorBrush::create(&self.rt)
-            .with_color(color_to_colorf(color))
-            .build()
-            .wrap()
+    fn solid_brush(&mut self, color: Color) -> Brush {
+        self.rt
+            .create_solid_color(color_to_colorf(color))
             .expect("error creating solid brush")
-            .to_generic() // This does an extra COM clone; avoid somehow?
     }
 
-    fn gradient(&mut self, gradient: Gradient) -> Result<GenericBrush, Error> {
+    fn gradient(&mut self, gradient: Gradient) -> Result<Brush, Error> {
         match gradient {
             Gradient::Linear(linear) => {
-                let mut builder = LinearGradientBrushBuilder::new(&self.rt)
-                    .with_start(to_point2f(linear.start))
-                    .with_end(to_point2f(linear.end));
-                for stop in &linear.stops {
-                    builder = builder.with_stop(gradient_stop_to_d2d(stop));
-                }
-                let brush = builder.build().wrap()?;
-                // Same concern about extra COM clone as above.
-                Ok(brush.to_generic())
+                let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: to_point2f(linear.start),
+                    endPoint: to_point2f(linear.end),
+                };
+                let stops: Vec<_> = linear.stops.iter().map(gradient_stop_to_d2d).collect();
+                let stops = self.rt.create_gradient_stops(&stops)?;
+                let result = self.rt.create_linear_gradient(&props, &stops)?;
+                Ok(result)
             }
             Gradient::Radial(radial) => {
-                let radius = radial.radius as f32;
-                let mut builder = RadialGradientBrushBuilder::new(&self.rt)
-                    .with_center(to_point2f(radial.center))
-                    .with_origin_offset(to_point2f(radial.origin_offset))
-                    .with_radius(radius, radius);
-                for stop in &radial.stops {
-                    builder = builder.with_stop(gradient_stop_to_d2d(stop));
-                }
-                let brush = builder.build().wrap()?;
-                // Ditto
-                Ok(brush.to_generic())
+                let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+                    center: to_point2f(radial.center),
+                    gradientOriginOffset: to_point2f(radial.origin_offset),
+                    radiusX: radial.radius as f32,
+                    radiusY: radial.radius as f32,
+                };
+                let stops: Vec<_> = radial.stops.iter().map(gradient_stop_to_d2d).collect();
+                let stops = self.rt.create_gradient_stops(&stops)?;
+                let result = self.rt.create_radial_gradient(&props, &stops)?;
+                Ok(result)
             }
         }
     }
@@ -255,7 +195,7 @@ impl<'a> RenderContext for D2DRenderContext<'a> {
     fn fill(&mut self, shape: impl Shape, brush: &Self::Brush, fill_rule: FillRule) {
         // TODO: various special-case shapes, for efficiency
         match path_from_shape(self.factory, true, shape, fill_rule) {
-            Ok(path) => self.rt.fill_geometry(&path, brush),
+            Ok(path) => self.rt.fill_geometry(&path, brush, None),
             Err(e) => self.err = Err(e),
         }
     }
@@ -286,10 +226,10 @@ impl<'a> RenderContext for D2DRenderContext<'a> {
 
     fn clip(&mut self, shape: impl Shape, fill_rule: FillRule) {
         // TODO: set size based on bbox of shape.
-        let layer = match Layer::create(&mut self.rt, None).wrap() {
+        let layer = match self.rt.create_layer(None) {
             Ok(layer) => layer,
             Err(e) => {
-                self.err = Err(e);
+                self.err = Err(e.into());
                 return;
             }
         };
@@ -300,10 +240,7 @@ impl<'a> RenderContext for D2DRenderContext<'a> {
                 return;
             }
         };
-        // TODO: we get a use-after-free crash if we don't do this. Almost certainly
-        // this will be fixed in direct2d 0.3, so remove workaround when upgrading.
-        let _clone = path.clone();
-        self.rt.push_layer(&layer).with_mask(path).push();
+        self.rt.push_layer_mask(&path, &layer);
         self.ctx_stack.last_mut().unwrap().n_layers_pop += 1;
     }
 
@@ -320,9 +257,9 @@ impl<'a> RenderContext for D2DRenderContext<'a> {
             return;
         }
         // Direct2D takes upper-left, so adjust for baseline.
-        let pos = to_point2f(pos.into());
-        let pos = pos - Vector2F::new(0.0, line_metrics[0].baseline());
-        let text_options = DrawTextOptions::NONE;
+        let mut pos = to_point2f(pos.into());
+        pos.y -= line_metrics[0].baseline;
+        let text_options = D2D1_DRAW_TEXT_OPTIONS_NONE;
 
         self.rt
             .draw_text_layout(pos, &layout.0, brush, text_options);
@@ -374,8 +311,8 @@ impl<'a> RenderContext for D2DRenderContext<'a> {
     ) -> Result<Self::Image, Error> {
         // TODO: this method _really_ needs error checking, so much can go wrong...
         let alpha_mode = match format {
-            ImageFormat::Rgb => AlphaMode::Ignore,
-            ImageFormat::RgbaPremul | ImageFormat::RgbaSeparate => AlphaMode::Premultiplied,
+            ImageFormat::Rgb => D2D1_ALPHA_MODE_IGNORE,
+            ImageFormat::RgbaPremul | ImageFormat::RgbaSeparate => D2D1_ALPHA_MODE_PREMULTIPLIED,
             _ => return Err(new_error(ErrorKind::NotSupported)),
         };
         let buf = match format {
@@ -408,19 +345,8 @@ impl<'a> RenderContext for D2DRenderContext<'a> {
             // This should be unreachable, we caught it above.
             _ => return Err(new_error(ErrorKind::NotSupported)),
         };
-        Bitmap::create(&self.rt)
-            .with_raw_data(
-                SizeU(D2D_SIZE_U {
-                    width: width as UINT32,
-                    height: height as UINT32,
-                }),
-                &buf,
-                width as UINT32 * 4,
-            )
-            .with_format(Format::R8G8B8A8Unorm)
-            .with_alpha_mode(alpha_mode)
-            .build()
-            .wrap()
+        let bitmap = self.rt.create_bitmap(width, height, &buf, alpha_mode)?;
+        Ok(bitmap)
     }
 
     fn draw_image(
@@ -430,20 +356,18 @@ impl<'a> RenderContext for D2DRenderContext<'a> {
         interp: InterpolationMode,
     ) {
         let interp = match interp {
-            InterpolationMode::NearestNeighbor => BitmapInterpolationMode::NearestNeighbor,
-            InterpolationMode::Bilinear => BitmapInterpolationMode::Linear,
+            InterpolationMode::NearestNeighbor => D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+            InterpolationMode::Bilinear => D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
         };
-        let src_size = image.get_size();
-        let src_rect = (0.0, 0.0, src_size.0.width, src_size.0.height);
         self.rt
-            .draw_bitmap(&image, rect_to_rectf(rect.into()), 1.0, interp, src_rect);
+            .draw_bitmap(&image, &rect_to_rectf(rect.into()), 1.0, interp, None);
     }
 }
 
 impl<'a> D2DText<'a> {
     /// Create a new factory that satisfies the piet `Text` trait given
     /// the (platform-specific) dwrite factory.
-    pub fn new(dwrite: &'a directwrite::Factory) -> D2DText<'a> {
+    pub fn new(dwrite: &'a DwriteFactory) -> D2DText<'a> {
         D2DText { dwrite }
     }
 }
@@ -457,8 +381,9 @@ impl<'a> Text for D2DText<'a> {
     fn new_font_by_name(&mut self, name: &str, size: f64) -> Result<Self::FontBuilder, Error> {
         // Note: the name is cloned here, rather than applied using `with_family` for
         // lifetime reasons. Maybe there's a better approach.
+        let builder = TextFormatBuilder::new(self.dwrite).size(size as f32);
         Ok(D2DFontBuilder {
-            builder: TextFormat::create(self.dwrite).with_size(size as f32),
+            builder,
             name: name.to_owned(),
         })
     }
@@ -468,12 +393,10 @@ impl<'a> Text for D2DText<'a> {
         font: &Self::Font,
         text: &str,
     ) -> Result<Self::TextLayoutBuilder, Error> {
-        // Same consideration as above, we clone the font and text for lifetime
-        // reasons.
         Ok(D2DTextLayoutBuilder {
-            builder: text_layout::TextLayout::create(self.dwrite),
-            format: font.0.clone(),
-            text: text.to_owned(),
+            builder: dwrite::TextLayoutBuilder::new(self.dwrite)
+                .format(&font.0)
+                .text(text),
         })
     }
 }
@@ -482,9 +405,7 @@ impl<'a> FontBuilder for D2DFontBuilder<'a> {
     type Out = D2DFont;
 
     fn build(self) -> Result<Self::Out, Error> {
-        Ok(D2DFont(
-            self.builder.with_family(&self.name).build().wrap()?,
-        ))
+        Ok(D2DFont(self.builder.family(&self.name).build()?))
     }
 }
 
@@ -496,18 +417,15 @@ impl<'a> TextLayoutBuilder for D2DTextLayoutBuilder<'a> {
     fn build(self) -> Result<Self::Out, Error> {
         Ok(D2DTextLayout(
             self.builder
-                .with_text(&self.text)
-                .with_font(&self.format)
-                .with_width(1e6) // TODO: probably want to support wrapping
-                .with_height(1e6)
-                .build()
-                .wrap()?,
+                .width(1e6) // TODO: probably want to support wrapping
+                .height(1e6)
+                .build()?,
         ))
     }
 }
 
 impl TextLayout for D2DTextLayout {
     fn width(&self) -> f64 {
-        self.0.get_metrics().width() as f64
+        self.0.get_metrics().width as f64
     }
 }
