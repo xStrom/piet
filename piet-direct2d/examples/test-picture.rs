@@ -6,7 +6,7 @@ use piet::{samples, RenderContext};
 use piet_common::Device;
 
 // TODO: Improve support for fractional scaling where sample size ends up fractional.
-const SCALE: f64 = 2.0;
+const SCALE: f64 = 1.0;
 const FILE_PREFIX: &str = "d2d-test-";
 
 fn main() {
